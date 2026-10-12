@@ -1,17 +1,11 @@
 import httpx
 import respx
-from fastapi.testclient import TestClient
-
-from src.local_llm_service.main import app
-
-
-client = TestClient(app)
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 
 
 @respx.mock
-def test_extract_success():
+def test_extract_success(client):
     respx.post(OLLAMA_URL).mock(
         return_value=httpx.Response(
             200,
@@ -46,7 +40,7 @@ def test_extract_success():
 
 
 @respx.mock
-def test_extract_rejects_invalid_model_output():
+def test_extract_rejects_invalid_model_output(client):
     respx.post(OLLAMA_URL).mock(
         return_value=httpx.Response(
             200,
@@ -78,7 +72,7 @@ def test_extract_rejects_invalid_model_output():
     }
 
 
-def test_extract_rejects_empty_text():
+def test_extract_rejects_empty_text(client):
     response = client.post(
         "/extract",
         json={"text": ""},

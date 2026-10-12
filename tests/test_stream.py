@@ -1,17 +1,11 @@
 import httpx
 import respx
-from fastapi.testclient import TestClient
-
-from src.local_llm_service.main import app
-
-
-client = TestClient(app)
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 
 
 @respx.mock
-def test_stream_success():
+def test_stream_success(client):
     ollama_stream = (
         '{"message":{"role":"assistant","content":"Hello"},'
         '"done":false}\n'
@@ -53,7 +47,7 @@ def test_stream_success():
 
 
 @respx.mock
-def test_stream_ollama_http_error():
+def test_stream_ollama_http_error(client):
     respx.post(OLLAMA_URL).mock(
         return_value=httpx.Response(
             500,

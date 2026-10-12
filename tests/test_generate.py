@@ -1,17 +1,11 @@
 import httpx
 import respx
-from fastapi.testclient import TestClient
-
-from src.local_llm_service.main import app
-
-
-client = TestClient(app)
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 
 
 @respx.mock
-def test_generate_success():
+def test_generate_success(client):
     respx.post(OLLAMA_URL).mock(
         return_value=httpx.Response(
             200,
@@ -42,7 +36,7 @@ def test_generate_success():
 
 
 @respx.mock
-def test_generate_ollama_http_error():
+def test_generate_ollama_http_error(client):
     respx.post(OLLAMA_URL).mock(
         return_value=httpx.Response(
             500,
@@ -61,7 +55,7 @@ def test_generate_ollama_http_error():
     }
 
 
-def test_generate_rejects_empty_prompt():
+def test_generate_rejects_empty_prompt(client):
     response = client.post(
         "/generate",
         json={"prompt": ""},
@@ -70,7 +64,7 @@ def test_generate_rejects_empty_prompt():
     assert response.status_code == 422
 
 
-def test_generate_rejects_invalid_temperature():
+def test_generate_rejects_invalid_temperature(client):
     response = client.post(
         "/generate",
         json={

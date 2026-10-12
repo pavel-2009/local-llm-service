@@ -1,9 +1,11 @@
 """Basic llm service"""
 
 import os
+import json
 
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 OLLAMA_URL = os.getenv(
@@ -101,3 +103,98 @@ async def generate(
         text=content,
         model=data.get("model", OLLAMA_MODEL),
     )   
+
+
+@app.post("/stream")
+async def stream(
+    request: GenerateRequest
+) -> StreamingResponse:
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": request.prompt,
+            }
+        ],
+        "stream": True,
+        "options": {
+            "temperature": request.temperature,
+        },
+    }
+
+    async def generate_chunks():
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(120.0, connect=3.0)
+            ) as client:
+                async with client.stream(
+                    "POST",
+                    f"{OLLAMA_URL}/api/chat",
+                    json=payload,
+                ) as response:
+                    response.raise_for_status()
+
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+
+                        data = json.loads(line)
+
+                        message = data.get("message", {})
+                        content = message.get("content", "")
+
+                        if content:
+                            yield json.dumps(
+                                {
+                                    "type": "chunk",
+                                    "text": content,
+                                },
+                                ensure_ascii=False,
+                            ) + "\n"
+
+                        if data.get("done"):
+                            yield json.dumps(
+                                {"type": "done"},
+                                ensure_ascii=False,
+                            ) + "\n"
+
+                            return
+
+        except httpx.TimeoutException:
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "message": "Ollama request timed out",
+                }
+            ) + "\n"
+
+        except httpx.HTTPStatusError as exc:
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "message": "Ollama returned an HTTP error",
+                    "status_code": exc.response.status_code,
+                }
+            ) + "\n"
+
+        except httpx.RequestError:
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "message": "Cannot connect to Ollama",
+                }
+            ) + "\n"
+
+        except (json.JSONDecodeError, TypeError):
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "message": "Invalid response from Ollama",
+                }
+            ) + "\n"
+
+    return StreamingResponse(
+        generate_chunks(),
+        media_type="application/x-ndjson"
+    )

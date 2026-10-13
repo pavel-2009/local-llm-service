@@ -1,15 +1,16 @@
 import asyncio
 import json
 import logging
+import math
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .tools import get_weather
@@ -33,10 +34,21 @@ MAX_CONCURRENT_REQUESTS = int(
     os.getenv("MAX_CONCURRENT_REQUESTS", "2")
 )
 
-CONNECT_TIMEOUT = 3.0
-READ_TIMEOUT = 120.0
-WRITE_TIMEOUT = 10.0
-POOL_TIMEOUT = 5.0
+OLLAMA_RETRIES = max(0, int(os.getenv("OLLAMA_RETRIES", "1")))
+RETRY_BACKOFF_SECONDS = float(os.getenv("RETRY_BACKOFF_SECONDS", "0.2"))
+UPSTREAM_TOTAL_TIMEOUT = float(os.getenv("UPSTREAM_TOTAL_TIMEOUT", "150"))
+RATE_LIMIT_REQUESTS = max(1, int(os.getenv("RATE_LIMIT_REQUESTS", "30")))
+RATE_LIMIT_WINDOW_SECONDS = max(
+    1.0,
+    float(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60")),
+)
+
+CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "3"))
+READ_TIMEOUT = float(os.getenv("READ_TIMEOUT", "120"))
+WRITE_TIMEOUT = float(os.getenv("WRITE_TIMEOUT", "10"))
+POOL_TIMEOUT = float(os.getenv("POOL_TIMEOUT", "5"))
+
+RATE_LIMITED_PATHS = {"/generate", "/stream", "/extract", "/weather"}
 
 logging.basicConfig(level=logging.INFO)
 
@@ -111,6 +123,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.llm_semaphore = asyncio.Semaphore(
             MAX_CONCURRENT_REQUESTS
         )
+        app.state.rate_limit_lock = asyncio.Lock()
+        app.state.rate_limit_hits = {}
 
         logger.info("LLM service started; model=%s", OLLAMA_MODEL)
 
@@ -124,6 +138,45 @@ app = FastAPI(
     title="Local LLM service",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def apply_rate_limit(request: Request, call_next):
+    if request.method != "POST" or request.url.path not in RATE_LIMITED_PATHS:
+        return await call_next(request)
+
+    client_host = request.client.host if request.client else "unknown"
+    now = monotonic()
+    retry_after = 0
+
+    async with request.app.state.rate_limit_lock:
+        hits = request.app.state.rate_limit_hits
+        window_start, count = hits.get(client_host, (now, 0))
+        if now - window_start >= RATE_LIMIT_WINDOW_SECONDS:
+            window_start, count = now, 0
+
+        if count >= RATE_LIMIT_REQUESTS:
+            retry_after = max(
+                1,
+                math.ceil(RATE_LIMIT_WINDOW_SECONDS - (now - window_start)),
+            )
+        else:
+            hits[client_host] = (window_start, count + 1)
+
+        if len(hits) > 10_000:
+            expired_before = now - RATE_LIMIT_WINDOW_SECONDS
+            for host, (started, _) in list(hits.items()):
+                if started < expired_before:
+                    del hits[host]
+
+    if retry_after:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded"},
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    return await call_next(request)
 
 
 # --------------------------------------------------
@@ -183,6 +236,54 @@ def raise_upstream_error(exc: Exception) -> None:
         ) from exc
 
 
+def is_retryable_upstream_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, (httpx.TimeoutException, httpx.RequestError))
+
+
+async def post_ollama_chat(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    payload: dict,
+) -> httpx.Response:
+    try:
+        async with asyncio.timeout(UPSTREAM_TOTAL_TIMEOUT):
+            for attempt in range(OLLAMA_RETRIES + 1):
+                try:
+                    async with semaphore:
+                        response = await client.post(
+                            f"{OLLAMA_URL}/api/chat",
+                            json=payload,
+                        )
+                    response.raise_for_status()
+                    return response
+                except (httpx.TimeoutException,
+                        httpx.HTTPStatusError,
+                        httpx.RequestError) as exc:
+                    if attempt >= OLLAMA_RETRIES or not is_retryable_upstream_error(exc):
+                        raise
+                    logger.warning(
+                        "Retrying Ollama request; retry=%s",
+                        attempt + 1,
+                    )
+                    await asyncio.sleep(
+                        RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                    )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="Timed out waiting for Ollama",
+        ) from exc
+    except (httpx.TimeoutException,
+            httpx.HTTPStatusError,
+            httpx.RequestError) as exc:
+        raise_upstream_error(exc)
+        raise AssertionError("Unreachable")
+
+    raise AssertionError("Unreachable")
+
+
 async def call_ollama_chat(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
@@ -197,19 +298,7 @@ async def call_ollama_chat(
         tools=tools,
     )
 
-    try:
-        async with semaphore:
-            response = await client.post(
-                f"{OLLAMA_URL}/api/chat",
-                json=payload,
-            )
-            response.raise_for_status()
-
-    except (httpx.TimeoutException,
-            httpx.HTTPStatusError,
-            httpx.RequestError) as exc:
-        raise_upstream_error(exc)
-        raise AssertionError("Unreachable")
+    response = await post_ollama_chat(client, semaphore, payload)
 
     try:
         data = response.json()
@@ -251,20 +340,7 @@ async def generate(
 
     started_at = perf_counter()
 
-    try:
-        async with semaphore:
-            response = await client.post(
-                f"{OLLAMA_URL}/api/chat",
-                json=payload,
-            )
-
-            response.raise_for_status()
-
-    except (httpx.TimeoutException,
-            httpx.HTTPStatusError,
-            httpx.RequestError) as exc:
-        raise_upstream_error(exc)
-        raise AssertionError("Unreachable")
+    response = await post_ollama_chat(client, semaphore, payload)
 
     try:
         data = response.json()
@@ -311,49 +387,75 @@ async def stream(
     async def generate_chunks() -> AsyncIterator[str]:
         started_at = perf_counter()
         first_chunk_logged = False
+        received_upstream_event = False
 
         try:
-            # Hold the slot for the entire upstream stream.
-            async with semaphore:
-                async with client.stream(
-                    "POST",
-                    f"{OLLAMA_URL}/api/chat",
-                    json=payload,
-                ) as response:
-                    response.raise_for_status()
+            async with asyncio.timeout(UPSTREAM_TOTAL_TIMEOUT):
+                for attempt in range(OLLAMA_RETRIES + 1):
+                    try:
+                        # Hold the slot for the entire upstream stream.
+                        async with semaphore:
+                            async with client.stream(
+                                "POST",
+                                f"{OLLAMA_URL}/api/chat",
+                                json=payload,
+                            ) as response:
+                                response.raise_for_status()
 
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
+                                async for line in response.aiter_lines():
+                                    if not line:
+                                        continue
 
-                        data = json.loads(line)
+                                    received_upstream_event = True
+                                    data = json.loads(line)
+                                    message = data.get("message", {})
+                                    content = message.get("content", "")
 
-                        message = data.get("message", {})
-                        content = message.get("content", "")
+                                    if content:
+                                        if not first_chunk_logged:
+                                            logger.info(
+                                                "Stream TTFT=%.2fs",
+                                                perf_counter() - started_at,
+                                            )
+                                            first_chunk_logged = True
 
-                        if content:
-                            if not first_chunk_logged:
-                                logger.info(
-                                    "Stream TTFT=%.2fs",
-                                    perf_counter() - started_at,
-                                )
-                                first_chunk_logged = True
+                                        yield json.dumps({
+                                            "type": "chunk",
+                                            "text": content,
+                                        }) + "\n"
 
-                            yield json.dumps({
-                                "type": "chunk",
-                                "text": content,
-                            }) + "\n"
+                                    if data.get("done"):
+                                        yield json.dumps({
+                                            "type": "done",
+                                        }) + "\n"
+                                        logger.info(
+                                            "Stream completed; elapsed=%.2fs",
+                                            perf_counter() - started_at,
+                                        )
+                                        return
+                        return
+                    except (httpx.TimeoutException,
+                            httpx.HTTPStatusError,
+                            httpx.RequestError) as exc:
+                        if (
+                            received_upstream_event
+                            or attempt >= OLLAMA_RETRIES
+                            or not is_retryable_upstream_error(exc)
+                        ):
+                            raise
+                        logger.warning(
+                            "Retrying Ollama stream; retry=%s",
+                            attempt + 1,
+                        )
+                        await asyncio.sleep(
+                            RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                        )
 
-                        if data.get("done"):
-                            yield json.dumps({
-                                "type": "done",
-                            }) + "\n"
-
-                            logger.info(
-                                "Stream completed; elapsed=%.2fs",
-                                perf_counter() - started_at,
-                            )
-                            return
+        except TimeoutError:
+            yield json.dumps({
+                "type": "error",
+                "message": "Timed out waiting for Ollama",
+            }) + "\n"
 
         except httpx.TimeoutException:
             yield json.dumps({
@@ -429,20 +531,7 @@ async def extract(
     # Ollama supports constrained structured output via JSON Schema.
     payload["format"] = SupportClassification.model_json_schema()
 
-    try:
-        async with semaphore:
-            response = await client.post(
-                f"{OLLAMA_URL}/api/chat",
-                json=payload,
-            )
-
-            response.raise_for_status()
-
-    except (httpx.TimeoutException,
-            httpx.HTTPStatusError,
-            httpx.RequestError) as exc:
-        raise_upstream_error(exc)
-        raise AssertionError("Unreachable")
+    response = await post_ollama_chat(client, semaphore, payload)
 
     try:
         data = response.json()

@@ -12,6 +12,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .tools import get_weather
+
 
 # --------------------------------------------------
 # Configuration
@@ -77,6 +79,12 @@ class ExtractRequest(BaseModel):
     text: str = Field(min_length=1, max_length=10_000)
 
 
+class WeatherToolArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    city: str = Field(min_length=1, max_length=200)
+
+
 # --------------------------------------------------
 # Application lifecycle
 # --------------------------------------------------
@@ -131,10 +139,11 @@ def get_llm_semaphore(request: Request) -> asyncio.Semaphore:
 
 
 def build_payload(
-    messages: list[dict[str, str]],
+    messages: list[dict],
     *,
     temperature: float = 0.7,
     stream: bool = False,
+    tools: list[dict] | None = None,
 ) -> dict:
     return {
         "model": OLLAMA_MODEL,
@@ -143,6 +152,7 @@ def build_payload(
         "options": {
             "temperature": temperature,
         },
+        "tools": tools or [],
     }
 
 
@@ -170,6 +180,46 @@ def raise_upstream_error(exc: Exception) -> None:
         raise HTTPException(
             status_code=503,
             detail="Could not connect to Ollama",
+        ) from exc
+
+
+async def call_ollama_chat(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    messages: list[dict],
+    *,
+    temperature: float,
+    tools: list[dict] | None = None,
+) -> dict:
+    payload = build_payload(
+        messages,
+        temperature=temperature,
+        tools=tools,
+    )
+
+    try:
+        async with semaphore:
+            response = await client.post(
+                f"{OLLAMA_URL}/api/chat",
+                json=payload,
+            )
+            response.raise_for_status()
+
+    except (httpx.TimeoutException,
+            httpx.HTTPStatusError,
+            httpx.RequestError) as exc:
+        raise_upstream_error(exc)
+        raise AssertionError("Unreachable")
+
+    try:
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("Expected a JSON object")
+        return data
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid response from Ollama",
         ) from exc
 
 
@@ -419,3 +469,136 @@ async def extract(
         ) from exc
 
     return result
+
+
+@app.post("/weather")
+async def weather(
+    body: GenerateRequest,
+    request: Request,
+) -> GenerateResponse:
+    client = get_http_client(request)
+    semaphore = get_llm_semaphore(request)
+    messages: list[dict] = [
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful weather assistant. Use get_weather to "
+                "retrieve current conditions before answering. Never invent "
+                "weather data. Answer in the user's language and include "
+                "the location and local time when available."
+            ),
+        },
+        {"role": "user", "content": body.prompt},
+    ]
+    weather_tools = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather conditions for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "City name, preferably with country.",
+                    },
+                },
+                "required": ["city"],
+                "additionalProperties": False,
+            },
+        },
+    }]
+
+    data = await call_ollama_chat(
+        client,
+        semaphore,
+        messages,
+        temperature=0.0,
+        tools=weather_tools,
+    )
+    assistant_message = data.get("message")
+    if not isinstance(assistant_message, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid response from Ollama",
+        )
+
+    tool_calls = assistant_message.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        raise HTTPException(
+            status_code=502,
+            detail="The model did not request the weather tool",
+        )
+    if len(tool_calls) > 4:
+        raise HTTPException(
+            status_code=502,
+            detail="The model requested too many tool calls",
+        )
+
+    messages.append(assistant_message)
+    for tool_call in tool_calls:
+        function = tool_call.get("function")
+        if not isinstance(function, dict) or function.get("name") != "get_weather":
+            raise HTTPException(
+                status_code=502,
+                detail="The model requested an unsupported tool",
+            )
+
+        try:
+            arguments = WeatherToolArguments.model_validate(
+                function.get("arguments")
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="The model returned invalid weather tool arguments",
+            ) from exc
+
+        try:
+            weather_result = await get_weather(arguments.city, client)
+        except httpx.TimeoutException as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="Timed out waiting for the weather provider",
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "Weather provider returned HTTP %s",
+                exc.response.status_code,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Weather provider returned an HTTP error",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Could not connect to the weather provider",
+            ) from exc
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.exception("Invalid response from weather provider")
+            raise HTTPException(
+                status_code=502,
+                detail="Invalid response from the weather provider",
+            ) from exc
+
+        messages.append({
+            "role": "tool",
+            "content": json.dumps(weather_result, ensure_ascii=False),
+        })
+
+    final_data = await call_ollama_chat(
+        client,
+        semaphore,
+        messages,
+        temperature=0.0,
+    )
+    final_message = final_data.get("message")
+    text = final_message.get("content") if isinstance(final_message, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid final response from Ollama",
+        )
+
+    return GenerateResponse(text=text, model=OLLAMA_MODEL)
